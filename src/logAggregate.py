@@ -22,7 +22,7 @@ import re
 from datetime import datetime
 import hashlib
 import pytz
-
+import traceback
 
 class logAggregate(Sensor, Reconfigurable):
 
@@ -48,7 +48,7 @@ class logAggregate(Sensor, Reconfigurable):
         self.running = False
         self.log_data = {"error": {}}
         # 10 minutes default
-        self.duration = config.attributes.fields["duration"].number_value or 600
+        self.duration = config.attributes.fields["duration_secs"].number_value or 600
 
         asyncio.ensure_future(self.log_loop())
 
@@ -62,63 +62,84 @@ class logAggregate(Sensor, Reconfigurable):
         pattern = r'^(\w{3} \d{2} \d{2}:\d{2}:\d{2}) (\S+) (\S+)\[(\d+)\]: (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$'
 
         while self.running:
-            output = process.stdout.readline()
-            if output:
-                #    'timestamp': match.group(1),
-                #    'hostname': match.group(2),
-                #    'process': match.group(3),
-                #    'pid': int(match.group(4)),
-                #    'iso_timestamp': match.group(5),
-                #    'log_level': match.group(6),
-                #    'service': match.group(7),
-                #    'file': match.group(8),
-                #    'message': match.group(9)
-                match = re.match(pattern, output.strip())
-                if match.group(6) == "ERROR":
-                    # remove extra logging info
-                    m = match.group(9)
-                    p = r'\s*\{[^{}]*\}\s*$'
-                    m = re.sub(p, '', m)
+            try:
+                output = process.stdout.readline()
+                if output:
+                    #    'timestamp': match.group(1),
+                    #    'hostname': match.group(2),
+                    #    'process': match.group(3),
+                    #    'pid': int(match.group(4)),
+                    #    'iso_timestamp': match.group(5),
+                    #    'log_level': match.group(6),
+                    #    'service': match.group(7),
+                    #    'file': match.group(8),
+                    #    'message': match.group(9)
 
-                    # initialize
-                    if not "started" in self.log_data:
-                        self.log_data["started"] = match.group(5)
-                    message_hash = generate_md5(match.group(8) + m)
-                    if message_hash in self.log_data["error"]:
-                        self.log_data["error"][message_hash]["times"].append(match.group(5))
-                    else:
-                        self.log_data["error"][message_hash] = {"count": 1, "times": [match.group(5)], "message": m, "service": match.group(7), "file": match.group(8)}
-            for message in self.log_data["error"]:
-                for time in self.log_data["error"][message]["times"]:
-                    # remove any instanced older than the duration we are tracking
-                    diff = compare_timestamps(time, get_current_time_iso())
-                    if diff > self.duration:
-                        self.log_data["error"][message]["times"] = self.log_data["error"][message]["times"][1:]
-                self.log_data["error"][message]["count"] = len(self.log_data["error"][message]["times"])
-                if len(self.log_data["error"][message]["times"]) == 0:
-                    del self.log_data["error"][message]                    
+                    match = re.match(pattern, output.strip())
+                    if match is not None and match.group(6) == "ERROR":
+                        # remove extra logging info
+                        m = match.group(9)
+                        p = r'\s*\{[^{}]*\}\s*$'
+                        m = re.sub(p, '', m)
+
+                        # initialize
+                        if not "started" in self.log_data:
+                            self.log_data["started"] = match.group(5)
+                        message_hash = generate_md5(match.group(8) + m)
+                        if message_hash in self.log_data["error"]:
+                            self.log_data["error"][message_hash]["times"].append(match.group(5))
+                        else:
+                            self.log_data["error"][message_hash] = {"count": 1, "times": [match.group(5)], "message": m, "service": match.group(7), "file": match.group(8)}
+                
+                keys_to_delete = []
+                for message in self.log_data["error"]:
+                    for time in self.log_data["error"][message]["times"]:
+                        # remove any instanced older than the duration we are tracking
+                        diff = compare_timestamps(time, get_current_time_iso())
+                        if diff > self.duration:
+                            self.log_data["error"][message]["times"] = self.log_data["error"][message]["times"][1:]
+                    self.log_data["error"][message]["count"] = len(self.log_data["error"][message]["times"])
+                    if len(self.log_data["error"][message]["times"]) == 0:
+                        keys_to_delete.append(message)
+                for key in keys_to_delete:
+                    del self.log_data["error"][key]
+            except Exception as e:
+                self.logger.error(f'Error in sync loop: {e}')
+                self.logger.error(traceback.print_exc())              
             await asyncio.sleep(.01)                
                         
     async def get_readings(
         self, *, extra: Optional[Mapping[str, Any]] = None, timeout: Optional[float] = None, **kwargs
     ) -> Mapping[str, SensorReading]:
 
-        ret = {"count": 0, "errors": []}
+        ret = {"error_count": 0, "errors": []}
         if "started" in self.log_data:
             for message in self.log_data["error"]:
                 m = self.log_data["error"][message].copy()
+                m["last_timestamp"] = m["times"][-1]
                 del m["times"]
                 ret["errors"].append(m)
-                ret["count"] = ret["count"] + self.log_data["error"][message]["count"]
+                ret["error_count"] = ret["error_count"] + self.log_data["error"][message]["count"]
         ret["errors"] = sorted(ret["errors"], key=lambda x: x['count'], reverse=True)
         return ret
 
-
+def parse_timestamp(timestamp):
+    if timestamp.endswith('Z'):
+        # UTC timestamp
+        return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    else:
+        # Timestamp with offset
+        try:
+            return datetime.fromisoformat(timestamp)
+        except ValueError:
+            # Handle case where the colon is missing in the offset
+            timestamp = timestamp[:-2] + ":" + timestamp[-2:]
+            return datetime.fromisoformat(timestamp)
 
 def compare_timestamps(timestamp1, timestamp2):
     # Parse the timestamps into datetime objects
-    dt1 = datetime.fromisoformat(timestamp1.replace('Z', '+00:00'))
-    dt2 = datetime.fromisoformat(timestamp2.replace('Z', '+00:00'))
+    dt1 = parse_timestamp(timestamp1)
+    dt2 = parse_timestamp(timestamp2)
 
     # Calculate the time difference in seconds
     time_diff_seconds = abs((dt2 - dt1).total_seconds())
