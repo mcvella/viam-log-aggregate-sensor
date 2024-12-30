@@ -1,0 +1,15 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "mcvella:log-aggregate-sensor",
+  "visibility": "public",
+  "url": "https://github.com/mcvella/viam-log-aggregate-sensor",
+  "description": "Viam module that aggregates log error counts and messages over a specified duration.",
+  "models": [
+    {
+      "api": "rdk:component:sensor",
+      "model": "mcvella:sensor:log-aggregate"
+    }
+  ],
+  "entrypoint": "run.sh",
+  "first_run": ""
+}
